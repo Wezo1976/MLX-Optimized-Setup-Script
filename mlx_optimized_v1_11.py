@@ -27,6 +27,9 @@ import hashlib
 import re
 import numpy as np
 from rank_bm25 import BM25Okapi
+from graphrag import GraphRAGPipeline, QueryEngine
+from graphrag.ingest_pipeline import enrich_chunks
+from graphrag.provenance_logger import log_provenance
 
 # ────────────────────────────────────────────────
 # Config
@@ -47,6 +50,8 @@ TEMP_LOW = 0.35
 HYBRID_ALPHA = 0.7  # 70% semantic, 30% keyword
 
 AUDIT_LOG_PATH = "./rag_audit_log.jsonl"
+GRAPH_DATA_PATH = "./graphrag_data"
+GRAPH_PROVENANCE_LOG_PATH = "./graphrag_data/provenance_log.jsonl"
 
 os.environ["MLX_NUM_THREADS"] = "0"
 
@@ -93,7 +98,7 @@ def chunk_with_page_metadata(chunks_with_metadata: List[Dict], chunk_size=800) -
     result = []
     for item in chunks_with_metadata:
         text = item["text"]
-        for i in range(0, len(text), chunk_size - 150):
+        for i in range(0, len(text), chunk_size - CHUNK_OVERLAP):
             result.append({
                 "text": text[i:i+chunk_size],
                 "page": item["page"],
@@ -279,22 +284,30 @@ def get_or_create_collection(folder_path: str, force_reingest: bool):
 
         st.info(f"Found {len(pdf_paths)} PDFs. Ingesting...")
         all_chunks, all_metadatas, all_ids = [], [], []
+        ingested_chunk_records = []
 
-        for pdf_idx, path in enumerate(pdf_paths):
+        for path in pdf_paths:
             chunks_with_meta = extract_text_with_pages(path)
-            chunks_data = chunk_with_page_metadata(chunks_with_meta, CHUNK_SIZE)
+            chunks_data = enrich_chunks(chunks_with_meta, path, CHUNK_SIZE, CHUNK_OVERLAP)
             
-            for chunk_idx, chunk_data in enumerate(chunks_data):
+            for chunk_data in chunks_data:
                 all_chunks.append(chunk_data["text"])
                 all_metadatas.append({
                     "source": chunk_data["source"],
                     "page": chunk_data["page"],
-                    "chunk_id": chunk_idx
+                    "chunk_id": chunk_data["chunk_id"],
+                    "doc_id": chunk_data["doc_id"],
+                    "section": chunk_data["section"],
+                    "ingested_at": chunk_data["ingested_at"],
+                    "chunk_hash": chunk_data["chunk_hash"],
+                    "char_position": chunk_data["char_position"],
                 })
-                all_ids.append(f"doc_{pdf_idx}_chunk_{chunk_idx}")
+                all_ids.append(chunk_data["chunk_id"])
+                ingested_chunk_records.append(chunk_data)
 
         if all_chunks:
             collection.add(documents=all_chunks, metadatas=all_metadatas, ids=all_ids)
+            st.session_state["latest_chunk_records"] = ingested_chunk_records
             st.success(f"✅ Ingested {collection.count()} chunks from {len(pdf_paths)} PDFs!")
         else:
             st.warning("No valid text extracted from PDFs.")
@@ -342,9 +355,14 @@ def main():
     with st.sidebar:
         st.header("⚙️ Settings")
         pdf_folder = st.text_input("PDF Folder Path", value=DEFAULT_PDF_FOLDER)
+        retrieval_mode = st.selectbox("Retrieval Mode", ["Classic RAG", "GraphRAG"], index=0)
         wipe_checkbox = st.checkbox("🗑️ Wipe & Re-ingest", value=False,
                                     help="Delete current DB and re-process all PDFs")
+        rebuild_graph = st.checkbox("🧠 Rebuild Graph Index", value=False,
+                                    help="Rebuild graph artifacts from current chunks")
         st.session_state["wipe"] = wipe_checkbox
+        st.session_state["retrieval_mode"] = retrieval_mode
+        st.session_state["rebuild_graph"] = rebuild_graph
 
         high_load, resource_str = check_resources()
         st.markdown(f"**M4 Status** \n{resource_str}")
@@ -373,6 +391,23 @@ def main():
     if collection is None:
         st.stop()
 
+    graph_pipeline = GraphRAGPipeline(GRAPH_DATA_PATH)
+    if st.session_state.get("retrieval_mode") == "GraphRAG":
+        if st.session_state.get("rebuild_graph"):
+            if st.session_state.get("latest_chunk_records"):
+                build_result = graph_pipeline.build_from_chunks(st.session_state["latest_chunk_records"])
+            else:
+                build_result = graph_pipeline.build_from_collection(collection)
+            st.info(
+                f"Graph index rebuilt: {build_result['stats']['nodes']} nodes, "
+                f"{build_result['stats']['edges']} edges, "
+                f"{build_result['stats']['communities']} communities"
+            )
+            st.caption(f"Graph quality coverage: {build_result['stats']['quality']['coverage']:.0%}")
+        graph_artifacts = graph_pipeline.load_artifacts()
+    else:
+        graph_artifacts = {}
+
     # ──── Chat History ────
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -393,6 +428,14 @@ def main():
 
             # Retrieve using hybrid search
             results = hybrid_retrieval(collection, prompt, n_results=5, alpha=HYBRID_ALPHA)
+            graph_context = {}
+
+            if st.session_state.get("retrieval_mode") == "GraphRAG" and graph_artifacts.get("nodes"):
+                query_engine = QueryEngine(graph_artifacts)
+                graphrag_output = query_engine.retrieve(prompt, results)
+                results = graphrag_output["results"]
+                graph_context = graphrag_output["graph_context"]
+                log_provenance(GRAPH_PROVENANCE_LOG_PATH, prompt, graph_context)
             
             if not results.get("documents") or not results["documents"][0]:
                 full_response = "❌ No relevant chunks found in your PDFs."
@@ -453,7 +496,22 @@ Answer:"""
                 for i, meta in enumerate(results["metadatas"][0], 1):
                     page = meta.get('page', '?')
                     source = meta.get('source', 'unknown')
-                    st.markdown(f"{i}. **{source}** (Page {page})")
+                    chunk_id = meta.get("chunk_id", "n/a")
+                    cluster = graph_artifacts.get("metadata", {}).get("chunk_to_community", {}).get(chunk_id, "n/a")
+                    st.markdown(f"{i}. **{source}** (Page {page}) | Chunk `{chunk_id}` | Cluster `{cluster}`")
+
+                if graph_context:
+                    st.markdown("**🧠 Graph Evidence:**")
+                    st.markdown(
+                        f"- Path nodes traversed: {len(graph_context.get('node_ids', []))}\n"
+                        f"- Path edges traversed: {len(graph_context.get('edge_ids', []))}\n"
+                        f"- Seed entities: {len(graph_context.get('seed_nodes', []))}"
+                    )
+                    communities = graph_context.get("communities", [])
+                    if communities:
+                        with st.expander("Graph Communities Used"):
+                            for community in communities[:5]:
+                                st.markdown(f"- {community.get('summary', 'No summary')}")
 
                 # Validation warnings
                 if validation["issues"]:
