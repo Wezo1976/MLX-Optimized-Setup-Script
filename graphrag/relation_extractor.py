@@ -21,8 +21,6 @@ def extract_relations(text: str, entity_values: List[str]) -> List[Relation]:
         if len(present) < 2:
             continue
         for source, target in combinations(sorted(set(present)), 2):
-            if source == target:
-                continue
             relations.append(
                 Relation(
                     source=source,

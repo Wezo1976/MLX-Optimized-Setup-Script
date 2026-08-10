@@ -54,7 +54,6 @@ def build_graph(chunks: List[Dict]) -> Tuple[Dict[str, GraphNode], Dict[str, Gra
             chunk_entity_index.setdefault(chunk_id, []).append(nid)
 
         relations = extract_relations(text, values)
-        node_map = {(n.value, n.entity_type): n.id for n in nodes.values()}
         value_to_id = {}
         for entity in entities:
             nid = _node_id(entity.value, entity.entity_type)
